@@ -3,20 +3,12 @@ terraform {
   
   # Option 1: S3 Backend (AWS)
   backend "s3" {
-    bucket         = "samjean-s3-bucket"
+    bucket         = "vicogwa"
     key            = "todo-app/terraform.tfstate"
     region         = "us-east-1"
     encrypt        = true
-    dynamodb_table = "terraform-state-lock"
+    dynamodb_table = "vicogwa-state-lock"
   }
-
-  # Option 2: Terraform Cloud (Uncomment if using)
-  # cloud {
-  #   organization = "your-org"
-  #   workspaces {
-  #     name = "todo-app"
-  #   }
-  # }
 
   required_providers {
     aws = {
