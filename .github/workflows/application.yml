@@ -1,0 +1,220 @@
+name: Application Deployment
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'auth-api/**'
+      - 'todos-api/**'
+      - 'users-api/**'
+      - 'log-message-processor/**'
+      - 'docker-compose.yml'
+      - '.github/workflows/application.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy-application:
+    name: Deploy Application Changes
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+          terraform_wrapper: false
+
+      - name: Get SSH Key from Terraform
+        working-directory: infra/terraform
+        run: |
+          terraform init
+          mkdir -p ~/.ssh
+          terraform output -raw private_key_pem > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          
+          # Get server IP
+          SERVER_IP=$(terraform output -raw server_public_ip)
+          echo "SERVER_IP=${SERVER_IP}" >> $GITHUB_ENV
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Ansible
+        run: |
+          pip install ansible
+          ansible-galaxy collection install community.docker
+
+      - name: Setup SSH
+        run: |
+          # Add server to known hosts
+          ssh-keyscan -H ${{ env.SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+          
+          # Create SSH config
+          cat > ~/.ssh/config <<EOF
+          Host app-server
+              HostName ${{ env.SERVER_IP }}
+              User ubuntu
+              IdentityFile ~/.ssh/deploy_key
+              StrictHostKeyChecking no
+              UserKnownHostsFile /dev/null
+              IdentitiesOnly yes
+          EOF
+          
+          chmod 600 ~/.ssh/config
+
+      - name: Test SSH Connection
+        run: |
+          echo "Testing SSH connection..."
+          ssh app-server 'echo "✅ SSH connection successful"'
+
+
+      - name: Create Ansible Inventory
+        run: |
+          mkdir -p infra/ansible/inventory
+          
+          SSH_KEY_PATH=$(readlink -f ~/.ssh/deploy_key)
+          
+          cat > infra/ansible/inventory/hosts <<EOF
+          [app_servers]
+          app-server
+
+          [app_servers:vars]
+          ansible_user=ubuntu
+          ansible_ssh_private_key_file=${SSH_KEY_PATH}
+          ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes'
+          domain_name=${{ secrets.DOMAIN_NAME }}
+          jwt_secret=${{ secrets.JWT_SECRET }}
+          acme_email=${{ secrets.ACME_EMAIL }}
+          github_repo=${{ github.server_url }}/${{ github.repository }}.git
+          github_branch=${{ github.ref_name }}
+          EOF
+          
+          echo "=== Generated Inventory ==="
+          cat infra/ansible/inventory/hosts
+
+      - name: Test Ansible Connection
+        working-directory: infra/ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          echo "Testing Ansible connectivity..."
+          ansible all -i inventory/hosts -m ping -v
+
+      - name: Deploy Application with Ansible
+        working-directory: infra/ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          ANSIBLE_SSH_PIPELINING: "True"
+        run: |
+          echo "Deploying application changes..."
+          ansible-playbook -i inventory/hosts playbooks/deploy.yml -vv
+
+      - name: Wait for Application to Restart
+        run: |
+          echo "⏳ Waiting 45 seconds for containers to restart..."
+          sleep 45
+
+      - name: Verify deployment
+        run: |
+          echo "⏳ Waiting 45 seconds for containers to restart..."
+          sleep 45
+          
+          echo "🔍 Verifying application endpoints..."
+          
+          # Get server IP
+          SERVER_IP="${{ steps.get-server-ip.outputs.server_ip }}"
+          
+          # Check if app responds (allow any HTTP status)
+          if curl -s -o /dev/null -w "%{http_code}" http://$SERVER_IP | grep -q "301\|302\|200"; then
+            echo "✅ Application is responding"
+          else
+            echo "⚠️ Application may still be starting up"
+          fi
+          
+          echo "🎉 Deployment completed!"
+        continue-on-error: true  # Don't fail the workflow
+      - name: Check Container Status
+        if: always()
+        run: |
+          echo "Checking container status on server..."
+          ssh app-server 'cd /home/ubuntu/app && docker compose ps'
+
+  send_success_notification:
+    name: Send Success Notification
+    needs: deploy-application
+    if: success()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Send Success Email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "✅ TODO App Application Deployed Successfully"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: DevOps Alerts <${{ secrets.EMAIL_USERNAME }}>
+          body: |
+            ✅ Application Deployment Successful!
+            
+            Your application changes have been deployed successfully.
+            
+            Application URL: https://${{ secrets.DOMAIN_NAME }}
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Deployed by: ${{ github.actor }}
+            
+            Changes deployed:
+            ${{ github.event.head_commit.message }}
+            
+            View workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  send-failure-notification:
+    name: Send Failure Notification
+    needs: deploy-application
+    if: failure()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Send Failure Email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "❌ TODO App Application Deployment Failed"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: DevOps Alerts <${{ secrets.EMAIL_USERNAME }}>
+          body: |
+            ❌ Application Deployment Failed
+            
+            Application deployment encountered an error.
+            
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Triggered by: ${{ github.actor }}
+            
+            Failed commit message:
+            ${{ github.event.head_commit.message }}
+            
+            View workflow logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

@@ -1,0 +1,147 @@
+services:
+  traefik:
+    image: traefik:v2.11
+    container_name: traefik
+    restart: unless-stopped
+    environment:
+      - DOCKER_API_VERSION=1.44 
+    command:
+      - --api.insecure=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.myresolver.acme.tlschallenge=true
+      - --certificatesresolvers.myresolver.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json
+      - --entrypoints.web.http.redirections.entryPoint.to=websecure
+      - --entrypoints.web.http.redirections.entryPoint.scheme=https
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./letsencrypt:/letsencrypt
+    networks:
+      - app-network
+
+  redis-queue:
+    image: redis:7-alpine
+    container_name: redis-queue
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - app-network
+
+  users-api:
+    build: ./users-api
+    container_name: users-api
+    restart: unless-stopped
+    environment:
+      - SERVER_PORT=${SERVER_PORT}
+      - JWT_SECRET=${JWT_SECRET}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.users.rule=Host(`${DOMAIN_NAME}`) && PathPrefix(`/api/users`)
+      - traefik.http.routers.users.entrypoints=websecure
+      - traefik.http.routers.users.tls.certresolver=myresolver
+      - traefik.http.services.users.loadbalancer.server.port=${SERVER_PORT}
+      - traefik.http.middlewares.users-stripprefix.stripprefix.prefixes=/api/users
+      - traefik.http.routers.users.middlewares=users-stripprefix
+    networks:
+      - app-network
+
+  auth-api:
+    build: ./auth-api
+    container_name: auth-api
+    restart: unless-stopped
+    environment:
+      - AUTH_API_PORT=${AUTH_API_PORT}
+      - USERS_API_ADDRESS=${USERS_API_ADDRESS}
+      - JWT_SECRET=${JWT_SECRET}
+    labels:
+      - "traefik.enable=true"
+      
+      # Original /api/auth route
+      - "traefik.http.routers.auth-api.rule=Host(`${DOMAIN_NAME}`) && PathPrefix(`/api/auth`)"
+      - "traefik.http.routers.auth-api.entrypoints=websecure"
+      - "traefik.http.routers.auth-api.tls.certresolver=myresolver"
+      - "traefik.http.routers.auth-api.middlewares=auth-stripprefix"
+      - "traefik.http.middlewares.auth-stripprefix.stripprefix.prefixes=/api/auth"
+      
+      # Direct /login, /logout, /signup routes (for frontend)
+      - "traefik.http.routers.auth-direct.rule=Host(`${DOMAIN_NAME}`) && (Path(`/login`) || Path(`/logout`) || Path(`/signup`))"
+      - "traefik.http.routers.auth-direct.entrypoints=websecure"
+      - "traefik.http.routers.auth-direct.tls.certresolver=myresolver"
+      
+      # Service definition (shared by both routers)
+      - "traefik.http.services.auth.loadbalancer.server.port=${AUTH_API_PORT}"
+    networks:
+      - app-network
+    depends_on:
+      - users-api
+
+  todos-api:
+    build: ./todos-api
+    container_name: todos-api
+    restart: unless-stopped
+    environment:
+      - TODO_API_PORT=8082
+      - JWT_SECRET=${JWT_SECRET}
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - REDIS_CHANNEL=${REDIS_CHANNEL}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.todos.rule=Host(`${DOMAIN_NAME}`) && PathPrefix(`/api/todos`)
+      - traefik.http.routers.todos.entrypoints=websecure
+      - traefik.http.routers.todos.tls.certresolver=myresolver
+      - traefik.http.services.todos.loadbalancer.server.port=8082
+      - traefik.http.middlewares.todos-stripprefix.stripprefix.prefixes=/api/todos
+      - traefik.http.routers.todos.middlewares=todos-stripprefix
+    networks:
+      - app-network
+    depends_on:
+      - redis-queue
+
+  log-message-processor:
+    build: ./log-message-processor
+    container_name: log-message-processor
+    restart: unless-stopped
+    environment:
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - REDIS_CHANNEL=${REDIS_CHANNEL}
+    networks:
+      - app-network
+    depends_on:
+      - redis-queue
+
+  frontend:
+    build: ./frontend
+    container_name: frontend
+    restart: unless-stopped
+    environment:
+      - PORT=${PORT}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.frontend.rule=Host(`${DOMAIN_NAME}`)
+      - traefik.http.routers.frontend.entrypoints=websecure
+      - traefik.http.routers.frontend.tls.certresolver=myresolver
+      - traefik.http.services.frontend.loadbalancer.server.port=80
+    networks:
+      - app-network
+    depends_on:
+      - auth-api
+      - todos-api
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+    driver: local

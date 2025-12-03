@@ -1,0 +1,15 @@
+.env
+letsencrypt/
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.*
+infra/terraform/.terraform.lock.hcl
+infra/terraform/plan_output.txt
+infra/terraform/tfplan
+infra/terraform/terraform.tfvars
+infra/ansible/inventory/hosts
+infra/ansible/*.retry
+.vscode/
+.idea/
+*.swp
+.DS_Store
